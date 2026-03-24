@@ -1,0 +1,8 @@
+papers/
+checkpoints/
+checkpoints_*/
+eda_output/
+__pycache__/
+*.pyc
+.venv/
+*.parquet
