@@ -1,60 +1,50 @@
 """
-Evaluation: AUC of ROC (the official TAAC 2026 metric).
+Evaluation: AUC of ROC (official TAAC 2026 metric).
+Optimized: accumulate on GPU, transfer to CPU once at end.
 """
 
 import numpy as np
 import torch
 from sklearn.metrics import roc_auc_score
 from torch.utils.data import DataLoader
-from typing import Dict, Tuple
+from typing import Dict
 
 
 @torch.no_grad()
-def evaluate(
-    model: torch.nn.Module,
-    dataloader: DataLoader,
-    device: torch.device,
-) -> Dict[str, float]:
-    """
-    Evaluate model on a dataset.
-
-    Returns:
-        dict with "auc", "logloss", "num_samples", "pos_rate"
-    """
+def evaluate(model, dataloader, device) -> Dict[str, float]:
     model.eval()
-    all_labels = []
     all_preds = []
+    all_labels = []
 
     for batch in dataloader:
         batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v
                  for k, v in batch.items()}
         logits = model(batch)
-        probs = torch.sigmoid(logits.squeeze(-1))  # (B,)
-        all_preds.append(probs.cpu().numpy())
-        all_labels.append(batch["label"].cpu().numpy())
+        probs = torch.sigmoid(logits.squeeze(-1))
 
-    all_labels = np.concatenate(all_labels)
-    all_preds = np.concatenate(all_preds)
+        # Accumulate as tensors (avoid per-batch CPU sync)
+        all_preds.append(probs)
+        all_labels.append(batch["label"])
 
-    # AUC
+    # Single CPU transfer at end
+    all_preds = torch.cat(all_preds).cpu().numpy()
+    all_labels = torch.cat(all_labels).cpu().numpy()
+
     try:
         auc = roc_auc_score(all_labels, all_preds)
     except ValueError:
-        auc = 0.5  # only one class present
+        auc = 0.5
 
-    # LogLoss
     eps = 1e-7
-    all_preds_clipped = np.clip(all_preds, eps, 1 - eps)
+    preds_clip = np.clip(all_preds, eps, 1 - eps)
     logloss = -np.mean(
-        all_labels * np.log(all_preds_clipped) +
-        (1 - all_labels) * np.log(1 - all_preds_clipped)
+        all_labels * np.log(preds_clip) +
+        (1 - all_labels) * np.log(1 - preds_clip)
     )
-
-    pos_rate = all_labels.mean()
 
     return {
         "auc": float(auc),
         "logloss": float(logloss),
         "num_samples": int(len(all_labels)),
-        "pos_rate": float(pos_rate),
+        "pos_rate": float(all_labels.mean()),
     }

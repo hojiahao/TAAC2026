@@ -56,63 +56,76 @@ from config import Config
 
 class BlockAttnRes(nn.Module):
     """
-    Block Attention Residuals: replace fixed residual accumulation with
-    learned softmax attention over block-level representations.
+    Block Attention Residuals (Kimi, arXiv:2603.15031).
 
-    Standard residual: h_l = h_{l-1} + f_{l-1}(h_{l-1})
-      -> all layers accumulated with fixed unit weights
-      -> early layer info diluted, no selective access
+    Replaces fixed residual accumulation with learned softmax attention
+    over depth (block-level representations).
 
-    Block AttnRes: h_l = sum_i alpha_{i->l} * v_i
-      -> alpha computed via softmax attention over block outputs
-      -> each layer selectively retrieves from any previous block
+    Key design from paper:
+      - Each layer has ONE learnable pseudo-query w_l (d-dim vector, init to zero)
+      - Block representations b_n = sum of layer outputs within block n
+      - h_l = sum_{i=0}^{n-1} alpha_{i->l} * v_i  (softmax attention over blocks)
+      - alpha computed via phi(q_l, k_i) where phi uses RMSNorm inside
 
-    Reduces memory from O(Ld) to O(Nd) where N = number of blocks.
+    Benefits:
+      - Mitigates PreNorm dilution: bounded output magnitudes across depth
+      - More uniform gradient distribution
+      - Equivalent to 1.25x compute advantage in scaling law
+      - <2% inference overhead, negligible parameter increase
     """
 
-    def __init__(self, dim: int):
+    def __init__(self, dim: int, total_layers: int):
         super().__init__()
-        # Learned pseudo-query per layer (one d-dim vector)
-        self.res_proj = nn.Linear(dim, dim, bias=False)
-        self.res_norm = nn.RMSNorm(dim) if hasattr(nn, 'RMSNorm') else nn.LayerNorm(dim)
+        self.dim = dim
+        # One pseudo-query per layer (paper: "initialized to zero")
+        self.pseudo_queries = nn.ParameterList([
+            nn.Parameter(torch.zeros(dim)) for _ in range(total_layers)
+        ])
+        NormClass = nn.RMSNorm if hasattr(nn, 'RMSNorm') else nn.LayerNorm
+        self.res_norm = NormClass(dim)
 
     def forward(
         self,
-        current: torch.Tensor,          # (B, L, D) current layer output
-        block_outputs: List[torch.Tensor],  # list of (B, L, D) previous block outputs
-        partial_block: torch.Tensor,     # (B, L, D) intra-block accumulation
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        layer_idx: int,                     # current layer index (0-based)
+        layer_output: torch.Tensor,          # (B, L, D) f_l(h_{l-1}) — current layer's transformation
+        block_outputs: List[torch.Tensor],   # list of (B, D) block summaries (last-token pooled)
+        partial_sum: torch.Tensor,           # (B, D) intra-block accumulation (last-token)
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        Returns: (attended_output, updated_partial_block)
+        Returns: (h_l for all positions, updated_partial_sum, layer_output for potential block boundary)
         """
-        # Accumulate within current block
-        partial_block = partial_block + current
+        B = layer_output.shape[0]
+
+        # Intra-block: standard residual accumulation (sum of layer outputs within block)
+        current_last = layer_output[:, -1, :]  # (B, D) — last-token (target position)
+        partial_sum = partial_sum + current_last
 
         if len(block_outputs) == 0:
-            return partial_block, partial_block
+            # First block: only intra-block sum, no inter-block attention
+            return layer_output, partial_sum, current_last
 
-        # Inter-block attention: current attends to all previous block outputs
-        # Stack block outputs: (B, N, L, D) -> for efficiency, pool over L first
-        # Use last-token representation as block summary
-        block_summaries = torch.stack(
-            [b[:, -1, :] for b in block_outputs], dim=1
-        )  # (B, N, D)
-        block_summaries = self.res_norm(block_summaries)
+        # Inter-block attention: query = learned pseudo-query, keys/values = block summaries
+        w_l = self.pseudo_queries[layer_idx]  # (D,)
+        N = len(block_outputs)
 
-        # Query from current partial block's last token
-        query = self.res_proj(partial_block[:, -1, :]).unsqueeze(1)  # (B, 1, D)
+        # Stack block summaries: (B, N, D)
+        keys = torch.stack(block_outputs, dim=1)  # (B, N, D)
+        keys = self.res_norm(keys)
 
-        # Attention weights over blocks
-        scores = torch.matmul(query, block_summaries.transpose(-1, -2))  # (B, 1, N)
-        scores = scores / math.sqrt(query.shape[-1])
-        weights = F.softmax(scores, dim=-1)  # (B, 1, N)
+        # phi(q, k) = exp(q^T RMSNorm(k)) — paper uses RMSNorm inside phi
+        scores = torch.matmul(keys, w_l)  # (B, N) — broadcast w_l across batch
+        scores = scores * (1.0 / math.sqrt(self.dim))
+        weights = F.softmax(scores, dim=-1)  # (B, N)
 
-        # Weighted combination of block outputs (full token-level)
-        stacked = torch.stack(block_outputs, dim=1)  # (B, N, L, D)
-        # Broadcast weights: (B, 1, N, 1) * (B, N, L, D) -> sum over N -> (B, L, D)
-        attended = (weights.unsqueeze(-1) * stacked).sum(dim=1)  # (B, L, D)
+        # Weighted sum of block summaries
+        inter_block = torch.matmul(weights.unsqueeze(1), keys).squeeze(1)  # (B, D)
 
-        return partial_block + attended, partial_block
+        # Combine intra-block (current partial_sum) + inter-block
+        # Paper: h_l = alpha_0 * v_0 + ... + alpha_{n-1} * v_{n-1} + intra_contribution
+        # For all positions, add inter-block as global bias (lightweight)
+        combined = layer_output + inter_block.unsqueeze(1)  # (B, L, D)
+
+        return combined, partial_sum, current_last
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -238,8 +251,9 @@ class UnifiedRecModel(nn.Module):
         self.full_blocks = nn.ModuleList([BlockClass(**block_kwargs) for _ in range(n_full)])
         self.truncated_blocks = nn.ModuleList([BlockClass(**block_kwargs) for _ in range(n_trunc)])
 
-        # Block AttnRes: group every block_size layers into one block
-        self.block_attn_res = BlockAttnRes(D)
+        # Block AttnRes [Kimi]: per-layer pseudo-queries, block boundary grouping
+        total_layers = n_full + n_trunc
+        self.block_attn_res = BlockAttnRes(D, total_layers)
         self.attn_res_block_size = mc.attn_res_block_size
 
         self.final_norm = nn.LayerNorm(D)
@@ -419,9 +433,9 @@ class UnifiedRecModel(nn.Module):
 
         # ── Backbone with Block AttnRes [Kimi] ──
         use_ckpt = self.use_grad_ckpt and self.training
-        block_outputs = []      # completed block representations
-        partial_block = torch.zeros_like(x)  # intra-block accumulation
-        layer_count = 0
+        block_summaries = []     # list of (B, D) — completed block summaries (last-token)
+        partial_sum = torch.zeros(B, D, device=device)  # intra-block accumulation
+        layer_idx = 0
         block_size = self.attn_res_block_size
 
         # Full sequence layers [HSTU 2.0]
@@ -431,15 +445,21 @@ class UnifiedRecModel(nn.Module):
             else:
                 x = block(x, mask)
 
-            layer_count += 1
-            x, partial_block = self.block_attn_res(x, block_outputs, partial_block)
+            x, partial_sum, _ = self.block_attn_res(
+                layer_idx, x, block_summaries, partial_sum
+            )
+            layer_idx += 1
 
-            # Block boundary
-            if layer_count % block_size == 0:
-                block_outputs.append(partial_block.detach() if not self.training else partial_block)
-                partial_block = torch.zeros_like(x)
+            if layer_idx % block_size == 0:
+                block_summaries.append(partial_sum)
+                partial_sum = torch.zeros(B, D, device=device)
 
-        # Truncated layers [HSTU 2.0 Attention Truncation]
+        # Save remaining partial_sum as block if non-empty
+        if partial_sum.abs().sum() > 0:
+            block_summaries.append(partial_sum)
+            partial_sum = torch.zeros(B, D, device=device)
+
+        # Truncated layers [HSTU 2.0 Attention Truncation] + BlockAttnRes
         if self.mc.use_attention_truncation and len(self.truncated_blocks) > 0:
             trunc_len = min(self.mc.truncated_seq_len, L)
             x_trunc = x[:, -trunc_len:, :]
@@ -450,6 +470,16 @@ class UnifiedRecModel(nn.Module):
                     x_trunc = checkpoint(block, x_trunc, trunc_mask, **({"use_reentrant": False}))
                 else:
                     x_trunc = block(x_trunc, trunc_mask)
+
+                # BlockAttnRes for truncated layers too
+                x_trunc, partial_sum, _ = self.block_attn_res(
+                    layer_idx, x_trunc, block_summaries, partial_sum
+                )
+                layer_idx += 1
+
+                if layer_idx % block_size == 0:
+                    block_summaries.append(partial_sum)
+                    partial_sum = torch.zeros(B, D, device=device)
 
             x = torch.cat([x[:, :-trunc_len, :], x_trunc], dim=1)
 

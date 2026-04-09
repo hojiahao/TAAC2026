@@ -428,16 +428,240 @@ plt.tight_layout()
 plt.savefig(f'{OUTPUT_DIR}/07_overview.png', dpi=150, bbox_inches='tight')
 plt.close()
 
+# 预处理: CVR标签列
+df['cvr_label'] = (df['action_type'] == 2).astype(int)
+global_cvr = df['cvr_label'].mean()
+
+# ============================================================
+# 12. CVR按物品维度分析
+# ============================================================
+print("\n[12] CVR按物品维度分析")
+item_cvr = df.groupby('item_id').agg(
+    total=('cvr_label', 'count'),
+    converts=('cvr_label', 'sum')
+).assign(cvr=lambda x: x['converts'] / x['total'])
+print(f"  全局CVR: {global_cvr*100:.2f}%, 正负比1:{(1-global_cvr)/max(global_cvr,1e-9):.0f}")
+print(f"  有转化的物品: {(item_cvr['converts']>0).sum()}/{len(item_cvr)} ({(item_cvr['converts']>0).mean()*100:.1f}%)")
+print(f"  CVR=0的物品: {(item_cvr['cvr']==0).sum()}, CVR=100%: {(item_cvr['cvr']==1).sum()}")
+print(f"  物品CVR均值: {item_cvr['cvr'].mean()*100:.2f}%, 中位数: {item_cvr['cvr'].median()*100:.2f}%")
+
+fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+axes[0].hist(item_cvr['cvr'], bins=20, edgecolor='black', alpha=0.7, color='#FF9800')
+axes[0].set_title('Per-Item CVR Distribution')
+axes[0].axvline(global_cvr, color='red', linestyle='--', label=f'Global={global_cvr:.3f}')
+axes[0].legend()
+axes[1].scatter(item_cvr['total'], item_cvr['cvr'], alpha=0.5, s=10)
+axes[1].set_title('Item CVR vs Exposure Count')
+axes[1].set_xlabel('Exposures')
+axes[1].set_ylabel('CVR')
+axes[1].axhline(global_cvr, color='red', linestyle='--', alpha=0.5)
+plt.tight_layout()
+plt.savefig(f'{OUTPUT_DIR}/08_item_cvr.png', dpi=150, bbox_inches='tight')
+plt.close()
+
+# ============================================================
+# 13. 特征基数与值域分析
+# ============================================================
+print("\n[13] 特征基数与值域分析")
+all_fid_info = {}
+for feats_col in ['user_feature', 'item_feature']:
+    for feats in df[feats_col]:
+        for f in feats:
+            fid = f['feature_id']
+            ftype = f['feature_value_type']
+            if fid not in all_fid_info:
+                all_fid_info[fid] = {'type': ftype, 'values': set(), 'count': 0, 'arr_lens': []}
+            all_fid_info[fid]['count'] += 1
+            if ftype == 'int_value' and f.get('int_value') is not None:
+                all_fid_info[fid]['values'].add(int(f['int_value']))
+            elif ftype == 'float_value' and f.get('float_value') is not None:
+                all_fid_info[fid]['values'].add(round(f['float_value'], 4))
+            elif f.get('int_array') is not None:
+                all_fid_info[fid]['arr_lens'].append(len(f['int_array']) if hasattr(f['int_array'], '__len__') else 1)
+            elif f.get('float_array') is not None:
+                all_fid_info[fid]['arr_lens'].append(len(f['float_array']) if hasattr(f['float_array'], '__len__') else 1)
+
+print(f"  {'FID':>4} {'Type':<30} {'Cov':>5} {'Card':>8} {'ArrLen':>7}")
+print(f"  {'-'*60}")
+for fid in sorted(all_fid_info.keys()):
+    info = all_fid_info[fid]
+    cov = f"{info['count']/len(df)*100:.0f}%"
+    card = str(len(info['values'])) if info['values'] else '-'
+    arr = f"{np.mean(info['arr_lens']):.0f}" if info['arr_lens'] else '-'
+    print(f"  {fid:>4} {info['type']:<30} {cov:>5} {card:>8} {arr:>7}")
+high_card = sorted([(fid, len(i['values'])) for fid, i in all_fid_info.items() if len(i['values']) > 100], key=lambda x: -x[1])
+low_card = [(fid, len(i['values'])) for fid, i in all_fid_info.items() if 0 < len(i['values']) <= 10]
+print(f"\n  高基数(>100): {high_card[:10]}")
+print(f"  低基数(<=10): {low_card[:10]}")
+print(f"  Dense: fid=68({int(np.mean(all_fid_info[68]['arr_lens']))}维), fid=81({int(np.mean(all_fid_info[81]['arr_lens']))}维) → 可能是多模态embedding")
+
+fig, ax = plt.subplots(figsize=(16, 6))
+fids_all = sorted(all_fid_info.keys())
+cards_v = [max(len(all_fid_info[f]['values']), 0.5) for f in fids_all]
+ax.bar(range(len(fids_all)), cards_v, color=['#FF5722' if c > 100 else '#2196F3' if c > 10 else '#4CAF50' for c in cards_v], edgecolor='black', alpha=0.7)
+ax.set_xticks(range(len(fids_all)))
+ax.set_xticklabels(fids_all, rotation=90, fontsize=6)
+ax.set_title('Feature Cardinality (Red>100, Blue>10, Green<=10)')
+ax.set_yscale('log')
+plt.tight_layout()
+plt.savefig(f'{OUTPUT_DIR}/09_feature_cardinality.png', dpi=150, bbox_inches='tight')
+plt.close()
+
+# ============================================================
+# 14. 序列内时间间隔分析
+# ============================================================
+print("\n[14] 序列内时间间隔分析")
+for seq_name, ts_fid in [('content_seq', 41), ('item_seq', 29)]:
+    intervals = []
+    for seq in df['seq_feature']:
+        s = seq[seq_name]
+        if isinstance(s, np.ndarray): s = s.tolist()
+        if isinstance(s, list):
+            for feat in s:
+                if isinstance(feat, dict) and feat['feature_id'] == ts_fid and feat.get('int_array') is not None:
+                    ts_arr = feat['int_array']
+                    if hasattr(ts_arr, '__len__') and len(ts_arr) > 1:
+                        intervals.extend(np.abs(np.diff(ts_arr.astype(float) if hasattr(ts_arr, 'astype') else np.array(ts_arr, dtype=float))).tolist())
+                    break
+    if intervals:
+        intervals = np.array(intervals)
+        print(f"  {seq_name}(fid={ts_fid}): mean={intervals.mean():.0f}s({intervals.mean()/3600:.1f}h), "
+              f"<30min={100*(intervals<1800).mean():.0f}%, 30m-24h={100*((intervals>=1800)&(intervals<86400)).mean():.0f}%, >24h={100*(intervals>=86400).mean():.0f}%")
+
+# ============================================================
+# 15. 3条序列重叠度分析
+# ============================================================
+print("\n[15] 3条序列重叠度分析")
+print(f"  action_seq IDs: {sorted(action_seq_fids)}")
+print(f"  content_seq IDs: {sorted(content_seq_fids)}")
+print(f"  item_seq IDs: {sorted(item_seq_fids)}")
+print(f"  特征ID交集: action∩content={action_seq_fids & content_seq_fids or '无'}, action∩item={action_seq_fids & item_seq_fids or '无'}, content∩item={content_seq_fids & item_seq_fids or '无'}")
+print(f"  → 完全异构, MoT独立建模有意义")
+
+# ============================================================
+# 16. 转化vs非转化样本差异
+# ============================================================
+print("\n[16] 转化vs非转化样本差异")
+for seq_name in ['action_seq', 'content_seq', 'item_seq']:
+    lc, lk = [], []
+    for idx in range(len(df)):
+        row = df.iloc[idx]
+        s = row['seq_feature'][seq_name]
+        if isinstance(s, np.ndarray): s = s.tolist()
+        if isinstance(s, list) and len(s) > 0:
+            feat = s[0] if isinstance(s[0], dict) else None
+            if feat and feat.get('int_array') is not None:
+                l = len(feat['int_array']) if hasattr(feat['int_array'], '__len__') else 0
+                (lc if row['action_type'] == 2 else lk).append(l)
+    if lc and lk:
+        print(f"  {seq_name}: 转化={np.mean(lc):.0f} vs 非转化={np.mean(lk):.0f}")
+print(f"  用户特征数: 转化={df[df['action_type']==2]['user_feature'].apply(len).mean():.1f} vs 非转化={df[df['action_type']==1]['user_feature'].apply(len).mean():.1f}")
+print(f"  物品特征数: 转化={df[df['action_type']==2]['item_feature'].apply(len).mean():.1f} vs 非转化={df[df['action_type']==1]['item_feature'].apply(len).mean():.1f}")
+
+fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+for i, seq_name in enumerate(['action_seq', 'content_seq', 'item_seq']):
+    l0, l1 = [], []
+    for _, row in df.iterrows():
+        s = row['seq_feature'][seq_name]
+        if isinstance(s, np.ndarray): s = s.tolist()
+        if isinstance(s, list) and len(s) > 0 and isinstance(s[0], dict) and s[0].get('int_array') is not None:
+            l = len(s[0]['int_array']) if hasattr(s[0]['int_array'], '__len__') else 0
+            (l1 if row['action_type'] == 2 else l0).append(l)
+    axes[i].hist(l0, bins=30, alpha=0.6, label='Click-only', color='#2196F3')
+    axes[i].hist(l1, bins=30, alpha=0.6, label='Convert', color='#FF5722')
+    axes[i].set_title(f'{seq_name}: Convert vs Click')
+    axes[i].legend()
+plt.tight_layout()
+plt.savefig(f'{OUTPUT_DIR}/10_convert_vs_click.png', dpi=150, bbox_inches='tight')
+plt.close()
+
+# ============================================================
+# 17. 用户活跃度与长尾分析
+# ============================================================
+print("\n[17] 用户活跃度与长尾分析")
+user_counts = df['user_id'].value_counts()
+print(f"  用户: 仅1次曝光={100*(user_counts==1).mean():.0f}%, >=5次={100*(user_counts>=5).mean():.0f}%, Top10占{100*user_counts.head(10).sum()/len(df):.0f}%")
+print(f"  物品: 仅1次曝光={100*(item_counts==1).mean():.0f}%, >=5次={100*(item_counts>=5).mean():.0f}%, Top10占{100*item_counts.head(10).sum()/len(df):.0f}%")
+
+fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+axes[0].hist(user_counts.values, bins=50, edgecolor='black', alpha=0.7, color='#4CAF50', log=True)
+axes[0].set_title(f'User Activity Long-tail')
+axes[1].hist(item_counts.values, bins=50, edgecolor='black', alpha=0.7, log=True)
+axes[1].set_title(f'Item Frequency Long-tail')
+plt.tight_layout()
+plt.savefig(f'{OUTPUT_DIR}/11_longtail.png', dpi=150, bbox_inches='tight')
+plt.close()
+
+# ============================================================
+# 18. 序列特征值域 (检测时间戳)
+# ============================================================
+print("\n[18] 序列特征值域 (检测时间戳)")
+for seq_name in ['action_seq', 'content_seq', 'item_seq']:
+    print(f"  {seq_name}:")
+    r = df.iloc[0]['seq_feature'][seq_name]
+    if isinstance(r, np.ndarray): r = r.tolist()
+    if isinstance(r, list):
+        for feat in r:
+            if isinstance(feat, dict) and feat.get('int_array') is not None:
+                arr = feat['int_array']
+                if hasattr(arr, '__len__') and len(arr) > 0:
+                    mn, mx = int(np.min(arr)), int(np.max(arr))
+                    tag = " ← TIMESTAMP" if mn > 1700000000 else ""
+                    print(f"    fid={feat['feature_id']}: [{mn}, {mx}]{tag}")
+
+# ============================================================
+# 19. CVR随时间变化
+# ============================================================
+print("\n[19] CVR随时间变化")
+df['hour'] = df['timestamp'].apply(lambda t: datetime.datetime.fromtimestamp(t).hour)
+hourly_cvr = df.groupby('hour')['cvr_label'].mean()
+for h, c in hourly_cvr.items():
+    print(f"  {h:2d}时: {c*100:5.1f}% {'#' * int(c * 200)}")
+
+fig, ax = plt.subplots(figsize=(10, 5))
+hourly_cvr.plot(kind='bar', ax=ax, color='#FF5722', edgecolor='black')
+ax.set_title('CVR by Hour of Day')
+ax.axhline(global_cvr, color='blue', linestyle='--', label=f'Global={global_cvr:.3f}')
+ax.legend()
+plt.tight_layout()
+plt.savefig(f'{OUTPUT_DIR}/12_hourly_cvr.png', dpi=150, bbox_inches='tight')
+plt.close()
+
+# ============================================================
+# 20. Schema修正 (item_feature并非全部int_value)
+# ============================================================
+print("\n[20] Schema修正")
+print("  item_feature实际类型: int_value(14个) + int_array(fid14) + float_value(fid17)")
+print("  content_seq fid=41和item_seq fid=29是时间戳, 可用于时间编码")
+
+# ============================================================
+# 21. CVR预测关键发现总结
+# ============================================================
+print(f"\n[21] CVR预测关键发现")
+print(f"  1. 正负比1:{(1-global_cvr)/max(global_cvr,1e-9):.0f} → 需加权loss或PairwiseAUC")
+print(f"  2. 物品长尾: {(item_counts==1).sum()}/{len(item_counts)}仅出现1次 → 冷启动依赖特征")
+print(f"  3. 3条序列完全异构 → MoT独立建模")
+print(f"  4. fid=41,29是时间戳 → 可用于Session切分")
+print(f"  5. fid=68(256维),81(320维) → 多模态embedding, 需降维/投影")
+print(f"  6. 高基数vs低基数差异大 → embedding大小需按基数设定")
+
+# ============================================================
+# 最终输出
+# ============================================================
 print(f"\n{'='*70}")
-print(f"EDA分析完成! 所有图表已保存到 {OUTPUT_DIR}/ 目录")
+print(f"全部EDA分析完成! 共12张图表保存到 {OUTPUT_DIR}/")
 print(f"{'='*70}")
 print(f"""
-生成的图表:
-  1. 01_item_distribution.png      - 物品频次分布
-  2. 02_action_type_distribution.png - 行为类型分布
-  3. 03_timestamp_analysis.png     - 时间戳分析
-  4. 04_user_feature_coverage.png  - 用户特征覆盖率
-  5. 05_item_feature_coverage.png  - 物品特征覆盖率
-  6. 06_sequence_length_distribution.png - 序列长度分布
-  7. 07_overview.png               - 综合总览
+  01_item_distribution.png      - 物品频次分布
+  02_action_type_distribution.png - 行为类型分布
+  03_timestamp_analysis.png     - 时间戳分析
+  04_user_feature_coverage.png  - 用户特征覆盖率
+  05_item_feature_coverage.png  - 物品特征覆盖率
+  06_sequence_length_distribution.png - 序列长度分布
+  07_overview.png               - 综合总览
+  08_item_cvr.png               - 物品维度CVR分析
+  09_feature_cardinality.png    - 特征基数分布
+  10_convert_vs_click.png       - 转化vs非转化序列差异
+  11_longtail.png               - 用户/物品长尾分析
+  12_hourly_cvr.png             - CVR随时间变化
 """)

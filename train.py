@@ -22,6 +22,7 @@ from data.dataset import TAACDataset, build_dataloaders
 from model.unified_model import UnifiedRecModel
 from model.heads import build_loss
 from model.optimizer import build_optimizer as build_optimizer_v2
+from model.modules import clear_mask_cache
 from evaluate import evaluate
 
 
@@ -139,10 +140,14 @@ def train(config: Config):
     optimizer = build_optimizer(model, config)
     total_steps = len(train_loader) * config.train.epochs
 
-    # BF16 > FP16 for training stability (no loss scaling needed)
-    use_amp = config.train.fp16 or config.train.bf16
+    # ── Mixed Precision (PyTorch 2.x API) ──
+    has_cuda = torch.cuda.is_available()
+    use_amp = has_cuda and (config.train.fp16 or config.train.bf16)
     amp_dtype = torch.bfloat16 if config.train.bf16 else torch.float16
-    scaler = GradScaler("cuda", enabled=config.train.fp16 and not config.train.bf16)
+    amp_device = "cuda" if has_cuda else "cpu"
+    # BF16不需要GradScaler（不会overflow）; FP16才需要
+    use_scaler = has_cuda and config.train.fp16 and not config.train.bf16
+    scaler = GradScaler(device="cuda", enabled=use_scaler) if has_cuda else GradScaler(enabled=False)
 
     # ── Training Loop ──
     os.makedirs(config.train.save_dir, exist_ok=True)
@@ -161,7 +166,7 @@ def train(config: Config):
             batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v
                      for k, v in batch.items()}
 
-            with autocast("cuda", enabled=use_amp, dtype=amp_dtype):
+            with autocast(amp_device, enabled=use_amp, dtype=amp_dtype):
                 logits = model(batch)
                 loss = compute_loss(logits, batch, criterion)
                 loss = loss / config.train.gradient_accumulation_steps
