@@ -35,6 +35,11 @@ class FeatureConfig:
     default_vocab_size: int = 100000
     max_array_len: int = 16
 
+    # 时间戳特征 (不做embedding, 用连续编码, EDA验证: fid=28,29,41)
+    timestamp_feature_ids: List[int] = field(default_factory=lambda: [28, 29, 41])
+    # 高基数特征的hash bucket上限 (防止vocab爆炸, 正式数据可能有百万级unique值)
+    max_hash_bucket: int = 200000
+
 
 @dataclass
 class ModelConfig:

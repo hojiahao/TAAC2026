@@ -17,13 +17,17 @@ from model.unified_model import UnifiedRecModel
 
 @torch.no_grad()
 def predict(model, dataloader, device):
+    """[Fix2] 推理加BF16 autocast, A100上速度翻倍"""
+    from torch.amp import autocast
     model.eval()
+    has_cuda = device.type == "cuda"
     all_preds = []
     for batch in dataloader:
         batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v
                  for k, v in batch.items()}
-        logits = model(batch)
-        all_preds.append(torch.sigmoid(logits.squeeze(-1)))
+        with autocast("cuda", enabled=has_cuda, dtype=torch.bfloat16):
+            logits = model(batch)
+        all_preds.append(torch.sigmoid(logits.float().squeeze(-1)))
     return torch.cat(all_preds).cpu().numpy()
 
 

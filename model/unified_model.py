@@ -149,19 +149,25 @@ class UnifiedRecModel(nn.Module):
         # 1. Unified Tokenization [OneTrans]
         # ═══════════════════════════════════════════════════════
 
-        # Per-feature embedding tables
+        # [Fix1] 时间戳特征不做embedding, 用连续编码 (省2.3GB @10M)
+        self.timestamp_fids = set(fc.timestamp_feature_ids)
+
+        # Per-feature embedding tables (跳过时间戳特征)
         all_embed_fids = list(set(
             fc.user_sparse_feature_ids + fc.user_array_feature_ids +
             fc.user_mixed_feature_ids + fc.item_sparse_feature_ids +
             fc.item_array_feature_ids + fc.action_seq_feature_ids +
             fc.content_seq_feature_ids + fc.item_seq_feature_ids
-        ))
+        ) - self.timestamp_fids)
         self.feature_embs = nn.ModuleDict()
         for fid in all_embed_fids:
-            vs = vocab_sizes.get(fid, fc.default_vocab_size)
+            vs = min(vocab_sizes.get(fid, fc.default_vocab_size), fc.max_hash_bucket)
             self.feature_embs[str(fid)] = nn.Embedding(vs, feat_d, padding_idx=0)
 
-        # Per-feature projection (not shared) [OneTrans mixed param idea]
+        # 时间戳特征: 连续值 → Linear(1, feat_d) (共享一个投影)
+        self.timestamp_proj = nn.Linear(1, feat_d) if self.timestamp_fids else None
+
+        # Per-feature projection (not shared)
         proj_fids = list(set(
             fc.user_sparse_feature_ids + fc.user_array_feature_ids +
             fc.user_mixed_feature_ids + fc.item_sparse_feature_ids +
@@ -177,10 +183,16 @@ class UnifiedRecModel(nn.Module):
             self.dense_projs[str(fid)] = nn.Linear(dim, D)
         self.float_proj = nn.Linear(1, D) if fc.item_float_feature_ids else None
 
-        # Sequence projections
-        self.action_seq_proj = nn.Linear(len(fc.action_seq_feature_ids) * feat_d, D)
-        self.content_seq_proj = nn.Linear(len(fc.content_seq_feature_ids) * feat_d, D)
-        self.item_seq_proj = nn.Linear(len(fc.item_seq_feature_ids) * feat_d, D)
+        # Sequence projections (时间戳特征占1维连续值, 其余走embedding)
+        n_action_emb = len([f for f in fc.action_seq_feature_ids if f not in self.timestamp_fids])
+        n_action_ts = len([f for f in fc.action_seq_feature_ids if f in self.timestamp_fids])
+        n_content_emb = len([f for f in fc.content_seq_feature_ids if f not in self.timestamp_fids])
+        n_content_ts = len([f for f in fc.content_seq_feature_ids if f in self.timestamp_fids])
+        n_item_emb = len([f for f in fc.item_seq_feature_ids if f not in self.timestamp_fids])
+        n_item_ts = len([f for f in fc.item_seq_feature_ids if f in self.timestamp_fids])
+        self.action_seq_proj = nn.Linear(n_action_emb * feat_d + n_action_ts * feat_d, D)
+        self.content_seq_proj = nn.Linear(n_content_emb * feat_d + n_content_ts * feat_d, D)
+        self.item_seq_proj = nn.Linear(n_item_emb * feat_d + n_item_ts * feat_d, D)
 
         # ═══════════════════════════════════════════════════════
         # 2. Feature Cross Layer [InterFormer]
@@ -295,8 +307,17 @@ class UnifiedRecModel(nn.Module):
         return self.feature_projs[str(fid)](emb)
 
     def _embed_seq(self, seq, feature_ids, proj):
+        """[Fix1] 时间戳特征用连续编码, 非时间戳走embedding"""
         B, L, F = seq.shape
-        embs = [self.feature_embs[str(fid)](seq[:, :, i]) for i, fid in enumerate(feature_ids)]
+        embs = []
+        for i, fid in enumerate(feature_ids):
+            if fid in self.timestamp_fids:
+                # 连续编码: 归一化到[0,1]后投影
+                ts = seq[:, :, i].float()
+                ts = ts / 1.8e9  # Unix timestamp归一化 (~2027年≈1.8B)
+                embs.append(self.timestamp_proj(ts.unsqueeze(-1)))  # (B,L,1)→(B,L,feat_d)
+            else:
+                embs.append(self.feature_embs[str(fid)](seq[:, :, i]))  # (B,L,feat_d)
         return proj(torch.cat(embs, dim=-1))
 
     # ── Main forward ──

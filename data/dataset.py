@@ -48,21 +48,17 @@ class TAACDataset(Dataset):
         else:
             self.vocab = vocab_builder
 
-        # 预解析DataFrame行到list，避免iloc的随机访问开销
-        # 在Angel平台上这能将数据加载速度提升3-5倍
-        self._rows = [self.df.iloc[i] for i in range(len(self.df))]
+        # 预解析: 小数据全量到list, 大数据保持DataFrame避免OOM
+        if len(self.df) <= 100000:
+            self._rows = [self.df.iloc[i] for i in range(len(self.df))]
+        else:
+            self._rows = None  # 大数据集用iloc, 依赖DataLoader多进程加速
 
     def __len__(self):
         return len(self.df)
 
     def __getitem__(self, idx) -> Dict[str, torch.Tensor]:
-        # 用.iloc[idx]取行 — pandas最慢的操作之一
-        # 优化: 如果数据量大，可预解析到list-of-dict (self._rows)
-        # 在Angel平台上DataFrame随机访问是主要IO瓶颈
-        if hasattr(self, '_rows'):
-            row = self._rows[idx]
-        else:
-            row = self.df.iloc[idx]
+        row = self._rows[idx] if self._rows is not None else self.df.iloc[idx]
 
         # ── 1. User features (4 types) ──
         user_sparse = parse_sparse_features(

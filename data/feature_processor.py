@@ -29,10 +29,11 @@ def _default_counter():
 class FeatureVocabBuilder:
     """Scan dataset to build vocabulary (value -> index) for each feature_id."""
 
-    def __init__(self):
-        # Use named functions instead of lambda so pickle works
+    def __init__(self, max_hash_bucket: int = 200000, timestamp_fids: Optional[set] = None):
         self.vocabs: Dict[int, Dict] = defaultdict(_default_vocab)
         self.counters: Dict[int, int] = defaultdict(_default_counter)
+        self.max_hash_bucket = max_hash_bucket
+        self.timestamp_fids = timestamp_fids or set()
 
     def scan_features(self, feature_list: List[dict]):
         """Process one sample's feature list (user_feature or item_feature)."""
@@ -61,6 +62,9 @@ class FeatureVocabBuilder:
             if not isinstance(feat, dict):
                 continue
             fid = feat["feature_id"]
+            # 跳过时间戳特征 (不做embedding, 用连续编码)
+            if fid in self.timestamp_fids:
+                continue
             if feat.get("int_array") is not None:
                 arr = feat["int_array"]
                 if hasattr(arr, "tolist"):
@@ -72,15 +76,26 @@ class FeatureVocabBuilder:
                         self.counters[fid] += 1
 
     def get_vocab_sizes(self) -> Dict[int, int]:
-        return {fid: len(vocab) for fid, vocab in self.vocabs.items()}
+        sizes = {}
+        for fid, vocab in self.vocabs.items():
+            # Hash bucket cap: 防止1M/10M数据时vocab爆炸到百万级
+            sizes[fid] = min(len(vocab), self.max_hash_bucket)
+        return sizes
 
     def encode_value(self, fid: int, value) -> int:
-        return self.vocabs[fid].get(int(value), 1)  # 1 = <UNK>
+        idx = self.vocabs[fid].get(int(value), 1)  # 1 = <UNK>
+        # Hash bucketing: 超过上限的用hash映射
+        vocab_size = len(self.vocabs[fid])
+        if vocab_size > self.max_hash_bucket:
+            idx = 2 + (hash(int(value)) % (self.max_hash_bucket - 2))  # 保留0=PAD, 1=UNK
+        return idx
 
 
-def build_vocab_from_dataframe(df: pd.DataFrame) -> FeatureVocabBuilder:
+def build_vocab_from_dataframe(df: pd.DataFrame, max_hash_bucket: int = 200000,
+                               timestamp_fids: Optional[set] = None) -> FeatureVocabBuilder:
     """Scan entire dataframe to build feature vocabularies."""
-    builder = FeatureVocabBuilder()
+    builder = FeatureVocabBuilder(max_hash_bucket=max_hash_bucket,
+                                  timestamp_fids=timestamp_fids or {28, 29, 41})
     for idx in range(len(df)):
         row = df.iloc[idx]
         builder.scan_features(row["user_feature"])
