@@ -12,10 +12,7 @@ echo "============================================"
 # ── Single GPU Training ──
 # uv run python train.py
 
-# ── 2-GPU DDP Training (比赛环境) ──
-# torchrun --nproc_per_node=2 train.py
-
-# ── Inference (单卡) ──
+# ── Inference ──
 # uv run python inference.py
 
 echo "Done! Check checkpoints/ for results."

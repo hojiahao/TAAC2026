@@ -5,10 +5,7 @@ Trains the SAME unified architecture at 4 scales (XS/S/M/L),
 plots AUC vs FLOPs to verify recommendation scaling law.
 
 Usage:
-    # Full study on competition data (1M+ samples)
-    torchrun --nproc_per_node=2 scaling_study.py --data data/train.parquet
-
-    # Quick test on demo data
+    python scaling_study.py --data data/train.parquet
     python scaling_study.py --data sample_data.parquet --epochs 3
 """
 
@@ -23,7 +20,7 @@ from data.dataset import build_dataloaders
 from model.unified_model import UnifiedRecModel
 from model.heads import build_loss
 from model.optimizer import build_optimizer
-from train import get_lr_scale, set_lr, compute_loss, setup_ddp, is_main_process
+from train import get_lr_scale, set_lr, compute_loss
 from evaluate import evaluate
 
 
@@ -43,10 +40,7 @@ def estimate_flops(config, seq_len=675):
 
 
 def train_one_scale(size: str, args):
-    rank, local_rank, world_size = setup_ddp()
-    use_ddp = world_size > 1
-    device = torch.device(f"cuda:{local_rank}" if use_ddp else
-                          "cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     config = get_scaling_config(size)
     config.train.train_data_path = args.data
@@ -58,26 +52,20 @@ def train_one_scale(size: str, args):
     config.train.num_workers = 0 if args.data == "sample_data.parquet" else 4
     config.train.save_dir = f"checkpoints_scaling/{size}"
 
-    if is_main_process(rank):
-        print(f"\n{'='*60}")
-        print(f"  Scaling Study: size={size}")
-        print(f"  D={config.model.embedding_dim}, H={config.model.num_heads}, "
-              f"L={config.model.num_layers}, feat_d={config.model.feature_embedding_dim}")
-        print(f"{'='*60}")
+    print(f"\n{'='*60}")
+    print(f"  Scaling Study: size={size}")
+    print(f"  D={config.model.embedding_dim}, H={config.model.num_heads}, "
+          f"L={config.model.num_layers}, feat_d={config.model.feature_embedding_dim}")
+    print(f"{'='*60}")
 
     train_loader, val_loader, vocab = build_dataloaders(config)
     model = UnifiedRecModel(config, vocab.get_vocab_sizes()).to(device)
 
-    if use_ddp:
-        from torch.nn.parallel import DistributedDataParallel as DDP
-        model = DDP(model, device_ids=[local_rank])
-
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     flops = estimate_flops(config)
 
-    if is_main_process(rank):
-        print(f"  Params: {n_params:,}")
-        print(f"  FLOPs/sample: {flops:,.0f}")
+    print(f"  Params: {n_params:,}")
+    print(f"  FLOPs/sample: {flops:,.0f}")
 
     criterion = build_loss(config)
     optimizer = build_optimizer(model, config)
@@ -102,15 +90,9 @@ def train_one_scale(size: str, args):
     train_time = time.time() - t0
 
     # Final evaluation
-    if is_main_process(rank):
-        eval_model = model.module if use_ddp else model
-        metrics = evaluate(eval_model, val_loader, device)
-        best_auc = metrics["auc"]
-        print(f"  → AUC={best_auc:.4f}  time={train_time:.1f}s")
-
-    if use_ddp:
-        import torch.distributed as dist
-        dist.destroy_process_group()
+    metrics = evaluate(model, val_loader, device)
+    best_auc = metrics["auc"]
+    print(f"  → AUC={best_auc:.4f}  time={train_time:.1f}s")
 
     return {
         "size": size,

@@ -6,6 +6,7 @@ Optimizations:
   2. Cached attention masks (avoid rebuild every forward)
   3. Vectorized Semi-Local + Hybrid mask building
   4. In-place operations where safe
+  5. Triton SiLU Attention kernel (avoids O(L²) attention matrix materialization)
 """
 
 import math
@@ -14,6 +15,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional, Dict, Tuple
 from functools import lru_cache
+
+# Auto-detect Triton availability
+from model.triton_kernels import TRITON_AVAILABLE
+if TRITON_AVAILABLE:
+    from model.triton_kernels import triton_silu_attention
 
 
 # ── Attention mask cache (avoids rebuilding every forward pass) ──
@@ -65,17 +71,20 @@ class SiLUAttention(nn.Module):
         v = v.view(B, L, H, d).transpose(1, 2)
         u = u.view(B, L, H, d).transpose(1, 2)
 
-        # SiLU attention (not softmax — can be negative)
-        scores = torch.matmul(q, k.transpose(-2, -1)) * (1.0 / math.sqrt(d))
-        scores = F.silu(scores)
+        if TRITON_AVAILABLE and x.is_cuda:
+            # Triton kernel: fused Q@K^T + SiLU + mask + @V (no O(L²) materialization)
+            attn_out = triton_silu_attention(q, k, v, attn_mask, scale=1.0 / math.sqrt(d))
+        else:
+            # PyTorch fallback
+            scores = torch.matmul(q, k.transpose(-2, -1)) * (1.0 / math.sqrt(d))
+            scores = F.silu(scores)
+            if attn_mask is not None:
+                scores = scores * attn_mask
+            attn_out = torch.matmul(scores, v)
 
-        if attn_mask is not None:
-            scores = scores * attn_mask
-
-        attn_out = torch.matmul(scores, v)
         attn_out = self.norm_attn(attn_out)
         attn_out = attn_out * u
-        attn_out = attn_out.transpose(1, 2).reshape(B, L, D)  # reshape faster than contiguous+view
+        attn_out = attn_out.transpose(1, 2).reshape(B, L, D)
         return self.dropout(self.out_proj(attn_out))
 
 

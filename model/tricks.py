@@ -15,6 +15,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional, Tuple
 
+from model.triton_kernels import TRITON_AVAILABLE
+if TRITON_AVAILABLE:
+    from model.triton_kernels import triton_silu_attention
+
 
 # ═══════════════════════════════════════════════════════════════════
 # 1. RoPE — Rotary Position Embedding
@@ -251,14 +255,19 @@ class EnhancedSiLUAttention(nn.Module):
 
         q, k = self.rope(q, k)
 
-        scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(d)
-        scores = self.att_match(scores, conversion_mask)
-        scores = F.silu(scores)
+        if TRITON_AVAILABLE and x.is_cuda and conversion_mask is None:
+            # Triton kernel: RoPE already applied, no ATTMatch bias
+            attn_out = triton_silu_attention(q, k, v, attn_mask, scale=1.0 / math.sqrt(d))
+        else:
+            # PyTorch fallback (handles ATTMatch additive bias)
+            scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(d)
+            scores = self.att_match(scores, conversion_mask)
+            scores = F.silu(scores)
+            if attn_mask is not None:
+                scores = scores * attn_mask
+            attn_out = torch.matmul(scores, v)
 
-        if attn_mask is not None:
-            scores = scores * attn_mask
-
-        attn_out = self.norm_attn(torch.matmul(scores, v))
+        attn_out = self.norm_attn(attn_out)
         attn_out = attn_out * u
         attn_out = attn_out.transpose(1, 2).contiguous().view(B, L, D)
         return self.dropout(self.out_proj(attn_out))
